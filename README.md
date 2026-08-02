@@ -1,156 +1,200 @@
 # Autoclicker IO
 
-A fast, precise auto clicker for Windows. Pure Python + `tkinter` + raw Win32 —
-**no third-party packages to install**.
+Autoclicker IO is a precise, configurable auto clicker and macro recorder for
+Windows. It is written with Python's standard library (`tkinter`, `ctypes`, and
+Win32 APIs), so the running application has no third-party dependencies.
 
-## Requirements
+Automation can affect the application that currently has focus. Use it only
+where you have permission, and start with a slow interval while checking a new
+configuration.
 
-- Windows 10 or 11
-- Python 3.10 or newer
+## Requirements and limitations
 
-The standard Python installer for Windows includes `tkinter`, so there is no
-`pip install` step.
+- Windows 10 or Windows 11 (64-bit for the published executable).
+- Python 3.10 or newer for a source checkout. Use the standard Windows Python
+  installer and include **Tcl/Tk**.
+- The application is Windows-only. It calls `user32.dll` directly and does not
+  provide a Linux, macOS, Wine, or headless-server fallback.
+- Windows security boundaries still apply: input sent to an elevated program
+  may require Autoclicker IO to run at the same elevation. It cannot bypass
+  secure desktops, UAC prompts, anti-cheat systems, or an application's own
+  automation policy.
 
-## Quick start
+## Install and run from source
 
-```bash
+Clone the repository, then run from its root. There is no runtime dependency to
+install:
+
+```powershell
 python main.py
-```
-
-You can also run the package directly:
-
-```bash
+# or
 python -m autoclicker
 ```
 
-The default global hotkeys are:
+To install the package in the active environment and expose the GUI command:
+
+```powershell
+python -m pip install .
+autoclicker-io
+```
+
+The `build` extra is optional and is only needed to produce a standalone
+executable:
+
+```powershell
+python -m pip install ".[build]"
+powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
+```
+
+PowerShell 7 users can substitute `pwsh` for `powershell`.
+
+The script checks Python and PyInstaller, cleans only the repository's explicit
+`build\` and `dist\` directories, and writes a versioned artifact such as
+`dist\AutoclickerIO-1.0.0-windows-x64.exe`.
+
+## Safe defaults and panic stop
+
+The first launch is idle and uses conservative defaults: a 100 ms interval,
+the current cursor position, cursor restoration after each click, and `F5` as a
+start/stop toggle. The interval and repeat settings are validated before a run
+starts.
+
+By default, press **Pause/Break** at any time for the global panic stop. It stops
+active clicking, recording, and macro playback without generating another input
+event. Use it before moving the pointer to investigate an unexpected run; `F5`
+remains the normal start/stop control. Both bindings can be changed in Hotkeys.
+
+Default global hotkeys:
 
 | Action | Hotkey |
 | --- | --- |
-| Start or stop clicking | `F5` |
-| Start or stop recording | `F7` |
-| Start or stop playback | `F8` |
+| Start/stop clicking | `F5` |
+| Start/stop recording | `F7` |
+| Start/stop playback | `F8` |
+| Panic stop | `Pause/Break` |
 
-Hotkeys can be changed from the app, including binding mouse buttons. Start
-with a slower interval while checking a new configuration so you can stop it
-comfortably.
+Hotkeys can be changed, including to mouse buttons. Bound hotkeys are hidden
+from other apps by default, and suppression can be disabled. The left/right
+buttons are never suppressed, so a binding cannot lock you out of the desktop.
 
 ## Features
 
-**Click interval**
+- Fixed or random intervals with hour/minute/second/millisecond precision and a
+  live clicks-per-second estimate.
+- Left, middle, right, X1, or X2 input; single, double, or triple clicks;
+  optional hold time and jitter.
+- Infinite, count-limited, or duration-limited repeats, with a visible start
+  countdown.
+- Current cursor, a captured fixed point, or a recorded sequence of points;
+  optional pixel jitter and cursor restoration.
+- Global keyboard and mouse-button hotkeys, optional suppression, and a
+  dedicated low-level hook thread.
+- Macro recording and playback of mouse movement, clicks, scrolling, and
+  keystrokes with timing, speed, repeat, looping, JSON save/load, and conversion
+  to a click sequence.
+- Named profiles, persistent settings, dark/light themes, and DPI-aware Tk
+  rendering.
+- A focused Basic view with an optional Advanced behavior panel, first-run
+  safety guidance, and keyboard-operable custom controls.
 
-- Fixed interval in hours / minutes / seconds / milliseconds
-- Random interval between a min and max, re-rolled before every click
-- Live "clicks per second" readout so you can see what you're actually asking for
+## Data and diagnostics locations
 
-**Click options**
+Settings are stored in the Windows roaming application-data directory:
 
-- Left, middle, right, or the two side buttons (X1 / X2)
-- Single, double or triple click — double clicks are timed so the OS really
-  reports them as double clicks, not two singles
-- Hold time per click, with optional random jitter
+```text
+%APPDATA%\AutoclickerIO\config.json
+%APPDATA%\AutoclickerIO\config.json.bak   (last known-good settings)
+%APPDATA%\AutoclickerIO\profiles\*.json
+%APPDATA%\AutoclickerIO\macros\*.json   (default macro-picker directory)
+%APPDATA%\AutoclickerIO\logs\autoclicker.log   (rotating diagnostics log)
+```
 
-**Repeat**
-
-- Until stopped, a fixed number of clicks, or for a fixed duration
-- Start delay with a visible countdown
-
-**Cursor position**
-
-- Click wherever the cursor happens to be
-- Click a fixed point — *Pick location* captures your next real click anywhere
-  on screen, so you can grab a target inside another app
-- Click through a recorded sequence of points, cycling round
-- Position jitter in pixels, and an option to put the cursor back after each
-  click so the clicker doesn't fight you for the mouse
-
-**Global hotkeys — keyboard *or* mouse buttons**
-
-- Bind Start, Stop, Record and Playback to any key, with modifiers (`Ctrl+Shift+F6`)
-- …or to a **mouse button**: middle, X1 or X2 (the side buttons), even left/right
-- Leave Start and Stop on the same binding and it toggles
-- *Hide hotkeys from other apps* stops a bound middle-click from also starting
-  autoscroll, or F5 from refreshing the page underneath. The left and right
-  buttons are never hidden, so you can't lock yourself out of your own desktop.
-- Hotkeys work while any other application is focused
-- The global mouse hook is only installed while a mouse button is actually bound
-
-**Appearance**
-
-- Dark and light themes, switched from the header, remembered between runs
-- DPI-aware: sharp and correctly sized on scaled displays
-
-**Record & playback**
-
-- Records real mouse movement, clicks, scrolling and keystrokes with timing
-- Replays at adjustable speed, N times or on a loop
-- Save and load macros as JSON
-- Export a macro's click points straight into the click-sequence mode
-
-**Profiles** — save and reload whole configurations by name. Settings persist
-automatically between runs.
-
-## How it works
-
-- Clicks are real `SendInput` events, not `PostMessage` fakes, so applications
-  that read raw input see them normally.
-- Cursor moves use absolute virtual-desktop coordinates, so they land on the
-  exact pixel across multiple monitors at any DPI scaling.
-- The interval loop asks Windows for a 1 ms scheduler tick, sleeps coarsely,
-  then spins for the final ~1.6 ms. Measured drift at a 10 ms interval is
-  ~0.02 ms per click.
-- Global hotkeys and recording use `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hooks on a
-  dedicated message-pump thread.
-- Everything the app injects is tagged, so recording never captures the app's
-  own output and hotkeys can't be triggered by synthetic keys.
-
-Settings and profiles are saved under `%APPDATA%\AutoclickerIO\`. The macro
-file picker uses `%APPDATA%\AutoclickerIO\macros\` by default, but macros can be
-saved anywhere.
-
-## Layout
-
-| File | Purpose |
-| --- | --- |
-| `autoclicker/winapi.py` | ctypes bindings for the Win32 APIs used |
-| `autoclicker/inputs.py` | `SendInput` wrappers and the high-resolution sleep |
-| `autoclicker/hooks.py` | global keyboard/mouse hooks on a message-pump thread |
-| `autoclicker/keys.py` | virtual-key tables, hotkey parsing and matching |
-| `autoclicker/engine.py` | the click loop |
-| `autoclicker/recorder.py` | macro recording, serialisation and playback |
-| `autoclicker/config.py` | settings model, persistence, profiles |
-| `autoclicker/theme.py` | palettes, DPI scaling, ttk restyling |
-| `autoclicker/widgets.py` | hand-drawn buttons, segmented controls, switches, cards |
-| `autoclicker/ui.py` | tkinter front end |
+Macros may also be saved anywhere through the file picker. Diagnostics are
+written lazily to the rotating log above when a warning or exception occurs;
+status text and error dialogs remain the primary user-facing diagnostics. If
+the per-user directory is unavailable, logging falls back safely and does not
+stop clicking. For source troubleshooting, launch `python main.py` from
+PowerShell to capture console output; the windowed packaged executable writes
+diagnostics to the rotating file instead. Do not put secrets or personal data
+in a report.
 
 ## Tests
 
-Run the non-injecting test scripts from the repository root:
+The CI workflow runs only tests that do not intentionally inject real mouse
+input, across Python 3.10, 3.11, 3.12, and 3.13:
 
-```bash
+```powershell
 python tests/test_core.py
+python tests/test_hardening.py
 python tests/test_mouse_hotkeys.py
-python tests/test_ui.py
+python tests/test_widget_accessibility.py
 ```
 
-`test_core.py` covers timing accuracy, the click engine's modes, config
-round-tripping, macro serialisation and hook lifecycle. `test_mouse_hotkeys.py`
-covers binding mouse buttons, the suppression rules and the hook install/release
-logic. `test_ui.py` builds the real Tk UI, switches themes and exercises every
-control. None of these three scripts emit real clicks, though the UI tests need
-an interactive Windows desktop.
+`test_core.py` covers timing, engine modes, configuration round-trips, macro
+serialization, hook lifecycle, and worker cleanup. `test_hardening.py` covers
+versioned settings, backup recovery, diagnostics, and malformed macro files.
+`test_mouse_hotkeys.py` covers mouse-button bindings, suppression, and hook
+install/release.
+`test_widget_accessibility.py` covers keyboard reachability, labels, focus,
+disabled-state behavior, and contrast-sensitive UI details. The panic-stop and
+error-path hardening checks are included in `tests/test_ui.py`.
 
-The live end-to-end test intentionally moves the pointer and injects real mouse
-input:
+`tests/test_ui.py` builds the real Tk window and should be run locally on an
+interactive Windows desktop. `tests/test_live.py` deliberately moves the
+pointer and injects real input into its own test window; it is never run by CI.
+Do not move the mouse while the live test is running.
 
-```bash
-python tests/test_live.py
-```
+## Release artifacts
 
-It clicks **only on its own test window** and restores the original cursor
-position when it finishes. Do not move the mouse while it runs.
+Every push to `main`, pull request, or manually dispatched workflow validates
+compilation and builds a wheel and source distribution. A separate, non-matrix
+job builds one PyInstaller executable with Python 3.13 and uploads the
+versioned `AutoclickerIO-<version>-windows-x64.exe` artifact. Runtime packages
+remain dependency-free; PyInstaller is build-time tooling only.
 
-## Responsible use
+The executable is not code-signed. Windows SmartScreen may therefore show an
+unknown-publisher warning. Verify the artifact source and inspect the version
+before allowing it to run; do not describe it as signed or trusted by
+Microsoft.
 
-Use input automation only where it is permitted. Some applications and online
-games prohibit automation in their terms of service.
+## Troubleshooting
+
+- **`python` is not recognized:** install Python 3.10+ from python.org, enable
+  “Add Python to PATH,” and open a new PowerShell window. Check with
+  `python --version`.
+- **Tkinter cannot import or the window will not open:** reinstall Python with
+  Tcl/Tk, then verify `python -m tkinter`. Tk UI tests need an interactive
+  desktop session.
+- **`ctypes.windll` or Win32 import errors:** this project only supports
+  Windows. Use `main.py` from a Windows Python, not WSL or a Linux container.
+- **The build script cannot find PyInstaller:** run
+  `python -m pip install ".[build]"` in the same environment and invoke the
+  script with PowerShell (`pwsh` or Windows PowerShell).
+- **An app does not receive clicks:** check that both applications have a
+  compatible elevation level and that the target allows automation. Press
+  `Pause/Break` to stop first; never test against a protected or online target
+  without permission.
+- **Settings behave unexpectedly:** close the app, back up, and inspect
+  `%APPDATA%\AutoclickerIO\config.json`. Removing `config.json` and its
+  `config.json.bak` backup resets global settings; profiles and macros are
+  separate directories.
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `autoclicker/winapi.py` | Win32 `ctypes` bindings |
+| `autoclicker/inputs.py` | `SendInput` wrappers and precise sleeping |
+| `autoclicker/hooks.py` | Low-level keyboard/mouse hooks |
+| `autoclicker/keys.py` | Virtual-key tables and hotkey matching |
+| `autoclicker/engine.py` | Click loop and repeat modes |
+| `autoclicker/recorder.py` | Macro recording, serialization, playback |
+| `autoclicker/config.py` | Settings persistence and profiles |
+| `autoclicker/diagnostics.py` | Best-effort rotating diagnostics log |
+| `autoclicker/ui.py` | Tkinter GUI |
+| `scripts/build.ps1` | Clean, versioned PyInstaller build |
+
+## License
+
+Autoclicker IO is released under the [MIT License](LICENSE) © 2026 PederK-Dev.
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting.

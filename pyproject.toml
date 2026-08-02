@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoclicker-io"
+dynamic = ["version"]
+description = "A precise, dependency-free Windows auto clicker with macro recording."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "PederK-Dev" },
+]
+keywords = ["autoclicker", "automation", "windows", "macro", "tkinter"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Desktop Environment",
+  "Topic :: Utilities",
+]
+# The application intentionally uses only Python's standard library at run time.
+dependencies = []
+
+[project.optional-dependencies]
+# Build tooling is optional so a source checkout remains dependency-free.
+build = ["pyinstaller>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/PederK-Dev/Autoclicker-IO"
+Repository = "https://github.com/PederK-Dev/Autoclicker-IO"
+Issues = "https://github.com/PederK-Dev/Autoclicker-IO/issues"
+Changelog = "https://github.com/PederK-Dev/Autoclicker-IO/blob/main/CHANGELOG.md"
+
+[project.gui-scripts]
+autoclicker-io = "autoclicker.ui:run"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["autoclicker*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autoclicker.__version__" }

@@ -19,6 +19,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import diagnostics
 from . import inputs
 from . import winapi as w
 
@@ -77,6 +78,7 @@ class HookManager:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._ready.clear()
         self._thread = threading.Thread(target=self._run, name="hook-pump", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5.0):
@@ -119,42 +121,65 @@ class HookManager:
     # -- hook thread -------------------------------------------------------
 
     def _run(self) -> None:
-        self._thread_id = w.kernel32.GetCurrentThreadId()
-        module = w.kernel32.GetModuleHandleW(None)
-        self._kb_hook = w.user32.SetWindowsHookExW(
-            w.WH_KEYBOARD_LL, self._kb_proc, module, 0
-        )
-        if not self._kb_hook:
+        try:
+            self._thread_id = w.kernel32.GetCurrentThreadId()
+            module = w.kernel32.GetModuleHandleW(None)
+            self._kb_hook = w.user32.SetWindowsHookExW(
+                w.WH_KEYBOARD_LL, self._kb_proc, module, 0
+            )
+            if not self._kb_hook:
+                error = ctypes.WinError(ctypes.get_last_error())
+                diagnostics.log_exception("Unable to install the global keyboard hook", error)
+                return
             self._ready.set()
-            raise ctypes.WinError(ctypes.get_last_error())
-        self._ready.set()
 
-        msg = w.wintypes.MSG()
-        while True:
-            result = w.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if result in (0, -1):
-                break
-            if not msg.hWnd:  # thread message, not a window message
-                if msg.message == _MSG_STOP:
+            msg = w.wintypes.MSG()
+            while True:
+                result = w.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result in (0, -1):
+                    if result == -1:
+                        diagnostics.log_warning("Global hook message pump returned an error")
                     break
-                if msg.message == _MSG_ENABLE_MOUSE and not self._mouse_hook:
-                    self._mouse_hook = w.user32.SetWindowsHookExW(
-                        w.WH_MOUSE_LL, self._mouse_proc, module, 0
-                    )
-                    continue
-                if msg.message == _MSG_DISABLE_MOUSE and self._mouse_hook:
+                if not msg.hWnd:  # thread message, not a window message
+                    if msg.message == _MSG_STOP:
+                        break
+                    if msg.message == _MSG_ENABLE_MOUSE and not self._mouse_hook:
+                        self._mouse_hook = w.user32.SetWindowsHookExW(
+                            w.WH_MOUSE_LL, self._mouse_proc, module, 0
+                        )
+                        if not self._mouse_hook:
+                            diagnostics.log_exception(
+                                "Unable to install the global mouse hook",
+                                ctypes.WinError(ctypes.get_last_error()),
+                            )
+                        continue
+                    if msg.message == _MSG_DISABLE_MOUSE and self._mouse_hook:
+                        try:
+                            w.user32.UnhookWindowsHookEx(self._mouse_hook)
+                        except Exception as exc:
+                            diagnostics.log_exception("Unable to remove the mouse hook", exc)
+                        self._mouse_hook = None
+                        continue
+                w.user32.TranslateMessage(ctypes.byref(msg))
+                w.user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            diagnostics.log_exception("Global hook thread failed", exc)
+        finally:
+            # Keep cleanup best-effort: a partially installed hook must never
+            # prevent the thread from terminating or block application exit.
+            self._ready.set()
+            if self._mouse_hook:
+                try:
                     w.user32.UnhookWindowsHookEx(self._mouse_hook)
-                    self._mouse_hook = None
-                    continue
-            w.user32.TranslateMessage(ctypes.byref(msg))
-            w.user32.DispatchMessageW(ctypes.byref(msg))
-
-        if self._mouse_hook:
-            w.user32.UnhookWindowsHookEx(self._mouse_hook)
-            self._mouse_hook = None
-        if self._kb_hook:
-            w.user32.UnhookWindowsHookEx(self._kb_hook)
-            self._kb_hook = None
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to remove the mouse hook", exc)
+                self._mouse_hook = None
+            if self._kb_hook:
+                try:
+                    w.user32.UnhookWindowsHookEx(self._kb_hook)
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to remove the keyboard hook", exc)
+                self._kb_hook = None
 
     # -- hook procedures ---------------------------------------------------
 
@@ -178,8 +203,10 @@ class HookManager:
                 for fn in listeners:
                     try:
                         swallow = bool(fn(event)) or swallow
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        diagnostics.log_exception(
+                            "Keyboard hook listener failed", exc, listener=type(fn).__name__
+                        )
                 if swallow:
                     return 1
         return w.user32.CallNextHookEx(None, code, wparam, lparam)
@@ -214,8 +241,10 @@ class HookManager:
                     for fn in listeners:
                         try:
                             swallow = bool(fn(event)) or swallow
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            diagnostics.log_exception(
+                                "Mouse hook listener failed", exc, listener=type(fn).__name__
+                            )
                     if swallow:
                         return 1
         return w.user32.CallNextHookEx(None, code, wparam, lparam)

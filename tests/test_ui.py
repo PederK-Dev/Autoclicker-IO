@@ -29,6 +29,17 @@ pump = lambda n=8: [(root.update(), time.sleep(0.01)) for _ in range(n)]
 pump()
 ok("main window builds")
 
+# --- first-run safety + progressive disclosure -----------------------------
+assert app._welcome_visible and app.settings.onboarding_complete is False
+app.dismiss_welcome(); pump()
+assert not app._welcome_visible and app.settings.onboarding_complete is True
+assert not app.advanced_card.winfo_ismapped()
+app.toggle_advanced(); pump()
+assert app.advanced_card.winfo_ismapped() and app.settings.advanced_mode is True
+app.toggle_advanced(); pump()
+assert not app.advanced_card.winfo_ismapped() and app.settings.advanced_mode is False
+ok("first-run safety guide dismisses and Basic/Advanced mode persists")
+
 # --- theme -----------------------------------------------------------------
 assert app.p.name == "dark"
 app.switch_theme(); pump()
@@ -92,7 +103,12 @@ ok("clicks-per-second readout and zero-interval warning")
 app.var_millis.set("abc"); app.var_repeat_count.set(""); app.var_rand_max.set("-3")
 app._update_rate_label(); got = app._collect()
 assert got.millis == 100 and got.repeat_count == 1 and got.random_max == 0.0
-ok("garbage in the number fields is coerced, never raises")
+numeric_errors = []
+ui.messagebox.showerror = lambda *a, **k: numeric_errors.append(a)
+app.var_millis.set("not-a-number")
+app.start_clicking(); pump(2)
+assert numeric_errors and not app.engine.running
+ok("garbage input is safe and must be corrected before starting")
 
 # --- starting with an invalid interval is refused ------------------------
 errors = []
@@ -121,6 +137,14 @@ assert app.engine.running, "hotkey did not start the engine"
 app._handle_key(KeyEvent(F5, True, False)); time.sleep(0.2); pump(10)
 assert not app.engine.running, "same-key hotkey did not toggle off"
 ok("a shared Start/Stop hotkey toggles clicking")
+
+app._apply_settings(config.Settings(millis=10))
+app.start_clicking(); pump(10)
+assert app.engine.running
+app._handle_key(KeyEvent(app.settings.panic_hotkey.vk, True, False))
+time.sleep(0.2); pump(10)
+assert not app.engine.running and "Emergency stop" in app._status_text
+ok("the dedicated panic hotkey stops active automation")
 
 app.settings.start_hotkey = keys.Hotkey(0x70)   # F1
 app.settings.stop_hotkey = keys.Hotkey(0x71)    # F2
@@ -195,6 +219,16 @@ assert app.settings.suppress_hotkeys is False
 assert "Ctrl+F4" in app.btn_start.text, app.btn_start.text
 app.settings.suppress_hotkeys = True
 ok("hotkey dialog saves the bindings, the suppress toggle and relabels Start")
+
+conflict = ui.HotkeyWindow(app); pump()
+conflict.pending["record_hotkey"] = conflict.pending["start_hotkey"]
+conflict_errors = []
+ui.messagebox.showerror = lambda *a, **k: conflict_errors.append(a)
+conflict.save(); pump()
+assert conflict_errors and conflict.winfo_exists(), "conflicting hotkeys must be rejected"
+conflict.pending["record_hotkey"] = keys.Hotkey(0x76)
+conflict.close(); pump()
+ok("conflicting action hotkeys are rejected while Start/Stop may share a toggle")
 
 app.macro = Macro([Event(0.0, "move", 11, 22), Event(0.1, "down", 11, 22, button="left"),
                    Event(0.2, "up", 11, 22, button="left"),

@@ -8,12 +8,14 @@ recording can never feed on itself.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from . import diagnostics
 from . import inputs
 from .config import config_dir
 from .hooks import HookManager, KeyEvent, MouseEvent
@@ -22,6 +24,22 @@ from .keys import BUTTON_TO_VK, vk_name
 # Movement samples closer together than this are dropped; replaying every
 # single hook sample makes huge macros without looking any smoother.
 MOVE_SAMPLE_INTERVAL = 0.012
+
+# Loading is deliberately bounded before JSON expansion and while validating
+# the resulting list.  These limits are generous for real recordings while
+# preventing accidental multi-gigabyte allocations or unbounded replay time.
+MACRO_SCHEMA_VERSION = 1
+MAX_MACRO_EVENTS = 100_000
+MAX_EVENTS = MAX_MACRO_EVENTS  # public alias for integrations/tests
+MAX_MACRO_FILE_BYTES = 16 * 1024 * 1024
+MAX_MACRO_SIZE_BYTES = MAX_MACRO_FILE_BYTES
+MAX_EVENT_TIME_SECONDS = 24 * 60 * 60
+MAX_COORDINATE = 2**31 - 1
+MAX_WHEEL_DELTA = 2**31 - 1
+KNOWN_EVENT_KINDS = frozenset({"move", "down", "up", "wheel", "key"})
+KNOWN_BUTTONS = frozenset({inputs.LEFT, inputs.MIDDLE, inputs.RIGHT, inputs.X1, inputs.X2})
+EVENT_KINDS = KNOWN_EVENT_KINDS
+BUTTONS = KNOWN_BUTTONS
 
 
 def macros_dir() -> Path:
@@ -53,8 +71,124 @@ class Event:
         return f"Key {verb} {vk_name(self.vk)}"
 
 
+def _field(item: dict, name: str, index: int) -> object:
+    if name not in item:
+        raise ValueError(f"Macro event {index} is missing required field '{name}'.")
+    return item[name]
+
+
+def _number(value: object, name: str, index: int, *, integer: bool = False) -> float | int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        kind = "integer" if integer else "number"
+        raise ValueError(f"Macro event {index} field '{name}' must be a {kind}.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"Macro event {index} field '{name}' must be finite.")
+    if integer and not isinstance(value, int):
+        raise ValueError(f"Macro event {index} field '{name}' must be an integer.")
+    return value
+
+
+def _decode_event(item: object, index: int) -> Event:
+    if not isinstance(item, dict):
+        raise ValueError(f"Macro event {index} must be an object.")
+
+    kind_value = _field(item, "kind", index)
+    if not isinstance(kind_value, str):
+        raise ValueError(f"Macro event {index} field 'kind' must be a string.")
+    kind = kind_value.strip().lower()
+    if kind not in KNOWN_EVENT_KINDS:
+        allowed = ", ".join(sorted(KNOWN_EVENT_KINDS))
+        raise ValueError(f"Macro event {index} has unknown kind {kind_value!r}; expected {allowed}.")
+
+    t_value = _number(_field(item, "t", index), "t", index)
+    try:
+        t = float(t_value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"Macro event {index} timestamp is outside the supported range.") from exc
+    if t < 0 or t > MAX_EVENT_TIME_SECONDS:
+        raise ValueError(
+            f"Macro event {index} timestamp must be between 0 and {MAX_EVENT_TIME_SECONDS} seconds."
+        )
+
+    # Mouse events carry coordinates.  Key events historically serialised the
+    # default x/y fields too, but they are irrelevant and remain optional.
+    x = y = 0
+    if kind != "key" or "x" in item or "y" in item:
+        x_value = _number(
+            _field(item, "x", index) if kind != "key" else item.get("x", 0),
+            "x",
+            index,
+            integer=True,
+        )
+        y_value = _number(
+            _field(item, "y", index) if kind != "key" else item.get("y", 0),
+            "y",
+            index,
+            integer=True,
+        )
+        x, y = int(x_value), int(y_value)
+        if abs(x) > MAX_COORDINATE or abs(y) > MAX_COORDINATE:
+            raise ValueError(f"Macro event {index} coordinates are outside the 32-bit range.")
+
+    button = item.get("button")
+    if button is not None:
+        if not isinstance(button, str) or button not in KNOWN_BUTTONS:
+            allowed = ", ".join(sorted(KNOWN_BUTTONS))
+            raise ValueError(f"Macro event {index} has unknown button {button!r}; expected {allowed}.")
+    if kind in ("down", "up") and button is None:
+        raise ValueError(f"Macro event {index} kind '{kind}' requires a button.")
+    if kind not in ("down", "up") and button is not None:
+        raise ValueError(f"Macro event {index} kind '{kind}' cannot specify a button.")
+
+    delta = 0
+    if kind == "wheel":
+        delta_value = _number(_field(item, "delta", index), "delta", index, integer=True)
+        delta = int(delta_value)
+        if abs(delta) > MAX_WHEEL_DELTA:
+            raise ValueError(f"Macro event {index} wheel delta is outside the 32-bit range.")
+    elif "delta" in item:
+        delta_value = _number(item["delta"], "delta", index, integer=True)
+        delta = int(delta_value)
+        if abs(delta) > MAX_WHEEL_DELTA:
+            raise ValueError(f"Macro event {index} wheel delta is outside the 32-bit range.")
+
+    vk = 0
+    pressed = False
+    if kind == "key":
+        vk_value = _number(_field(item, "vk", index), "vk", index, integer=True)
+        vk = int(vk_value)
+        if not 1 <= vk <= 0xFF:
+            raise ValueError(f"Macro event {index} virtual-key code must be between 1 and 255.")
+        pressed_value = _field(item, "pressed", index)
+        if not isinstance(pressed_value, bool):
+            raise ValueError(f"Macro event {index} field 'pressed' must be a boolean.")
+        pressed = pressed_value
+    elif "vk" in item:
+        vk_value = _number(item["vk"], "vk", index, integer=True)
+        vk = int(vk_value)
+        if not 0 <= vk <= 0xFF:
+            raise ValueError(f"Macro event {index} virtual-key code must be between 0 and 255.")
+
+    if "pressed" in item and kind != "key" and not isinstance(item["pressed"], bool):
+        raise ValueError(f"Macro event {index} field 'pressed' must be a boolean.")
+
+    return Event(
+        t=t,
+        kind=kind,
+        x=x,
+        y=y,
+        button=button,
+        delta=delta,
+        vk=vk,
+        pressed=pressed,
+    )
+
+
 class Macro:
     """An ordered list of :class:`Event` plus load/save helpers."""
+
+    MAX_EVENTS = MAX_MACRO_EVENTS
+    MAX_FILE_BYTES = MAX_MACRO_FILE_BYTES
 
     def __init__(self, events: list[Event] | None = None) -> None:
         self.events: list[Event] = events or []
@@ -71,7 +205,7 @@ class Macro:
         return [[e.x, e.y] for e in self.events if e.kind == "down"]
 
     def save(self, path: Path) -> None:
-        payload = {"version": 1, "events": [asdict(e) for e in self.events]}
+        payload = {"version": MACRO_SCHEMA_VERSION, "events": [asdict(e) for e in self.events]}
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=1)
@@ -79,25 +213,44 @@ class Macro:
 
     @classmethod
     def load(cls, path: Path) -> "Macro":
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        raw = payload.get("events", []) if isinstance(payload, dict) else payload
-        events = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            events.append(
-                Event(
-                    t=float(item.get("t", 0.0)),
-                    kind=str(item.get("kind", "move")),
-                    x=int(item.get("x", 0)),
-                    y=int(item.get("y", 0)),
-                    button=item.get("button"),
-                    delta=int(item.get("delta", 0)),
-                    vk=int(item.get("vk", 0)),
-                    pressed=bool(item.get("pressed", False)),
-                )
+        target = Path(path)
+        try:
+            size = target.stat().st_size
+        except OSError:
+            # Preserve the normal file-not-found/permission exception for the
+            # caller; only malformed content is normalised to ValueError below.
+            raise
+        if size > MAX_MACRO_FILE_BYTES:
+            raise ValueError(
+                f"Macro file is too large ({size} bytes; maximum is {MAX_MACRO_FILE_BYTES})."
             )
+
+        try:
+            with open(target, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise ValueError(f"Invalid macro JSON: {exc.msg if hasattr(exc, 'msg') else exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError("Macro payload must be an object with 'version' and 'events'.")
+        version = payload.get("version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("Macro version must be an integer.")
+        if version != MACRO_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported macro version: {version}.")
+        raw = payload.get("events")
+        if not isinstance(raw, list):
+            raise ValueError("Macro 'events' must be a JSON array.")
+        if len(raw) > MAX_MACRO_EVENTS:
+            raise ValueError(
+                f"Macro contains too many events ({len(raw)}; maximum is {MAX_MACRO_EVENTS})."
+            )
+
+        events: list[Event] = []
+        for index, item in enumerate(raw):
+            events.append(_decode_event(item, index))
+        # Existing files were sorted on load; retain that compatibility while
+        # rejecting negative/non-finite timestamps above.
         events.sort(key=lambda e: e.t)
         return cls(events)
 
@@ -192,6 +345,7 @@ class Player:
         self._cancel = threading.Event()
         self.iteration = 0
         self.position = 0
+        self.last_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -208,6 +362,7 @@ class Player:
         if self.running or not macro.events:
             return False
         self._cancel.clear()
+        self.last_error = None
         self.iteration = 0
         self.position = 0
         self._thread = threading.Thread(
@@ -227,11 +382,13 @@ class Player:
                 thread.join(timeout=2.0)
 
     def _run(self, macro: Macro, speed: float, repeat: int, loop: bool) -> None:
-        inputs.begin_high_resolution_timers()
         held_buttons: set[str] = set()
         held_keys: set[int] = set()
         reason = "stopped"
+        timers_started = False
         try:
+            inputs.begin_high_resolution_timers()
+            timers_started = True
             pass_index = 0
             while not self._cancel.is_set():
                 self.iteration = pass_index + 1
@@ -250,24 +407,32 @@ class Player:
                 # Small breather between passes so apps see distinct runs.
                 if not inputs.precise_sleep(0.05, self._cancel):
                     return
+        except Exception as exc:
+            reason = "error"
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            diagnostics.log_exception("Macro playback failed", exc)
         finally:
             # Never leave a button or key stuck down.
             for button in held_buttons:
                 try:
                     inputs.mouse_up(button)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to release held mouse button", exc, button=button)
             for vk in held_keys:
                 try:
                     inputs.key_up(vk)
-                except Exception:
-                    pass
-            inputs.end_high_resolution_timers()
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to release held key", exc, vk=vk)
+            if timers_started:
+                try:
+                    inputs.end_high_resolution_timers()
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to restore timer resolution", exc)
             if self._on_finished is not None:
                 try:
                     self._on_finished(reason)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    diagnostics.log_exception("Macro completion callback failed", exc)
 
     @staticmethod
     def _apply(event: Event, held_buttons: set[str], held_keys: set[int]) -> None:

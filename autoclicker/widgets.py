@@ -14,6 +14,16 @@ from tkinter import font as tkfont
 from .theme import Palette, mix, px
 
 
+_ACTIVATION_KEYS = frozenset(("space", "Return", "KP_Enter"))
+
+
+def _focus_ring(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
+                radius: float, colour: str) -> None:
+    """Draw the high-contrast focus indicator used by the canvas controls."""
+    round_rect(canvas, x1, y1, x2, y2, radius, fill="", outline=colour,
+               width=px(2))
+
+
 def round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
                r: float, **kw) -> int:
     """Rounded rectangle drawn as a smoothed polygon."""
@@ -44,15 +54,21 @@ class PillButton(tk.Canvas):
         self._hover = False
         self._pressed = False
         self._state = "normal"
+        self._focused = False
+        self._key_down: set[str] = set()
         self._h = px(height)
         self._fixed_width = px(width) if width else None
         super().__init__(parent, height=self._h, width=self._measure(),
                          bg=bg or palette.surface, highlightthickness=0, bd=0,
-                         cursor="hand2")
+                         cursor="hand2", takefocus=True)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<KeyPress>", self._on_key_press)
+        self.bind("<KeyRelease>", self._on_key_release)
         self.bind("<Configure>", lambda _e: self._draw())
         self._draw()
 
@@ -83,7 +99,9 @@ class PillButton(tk.Canvas):
         if state == self._state:
             return
         self._state = state
-        self.configure(cursor="" if state == "disabled" else "hand2")
+        self._key_down.clear()
+        self.configure(cursor="" if state == "disabled" else "hand2",
+                       takefocus=False if state == "disabled" else True)
         self._draw()
 
     # -- colours -----------------------------------------------------------
@@ -101,9 +119,18 @@ class PillButton(tk.Canvas):
         if self._state == "disabled":
             return mix(p.surface, p.raised, 0.5), p.muted, outline
         if self._pressed:
-            fill = mix(fill, p.shadow, 0.22)
+            wash = (
+                p.text
+                if self.kind in {"accent", "success", "danger"} and p.name == "light"
+                else p.shadow
+            )
+            fill = mix(fill, wash, 0.22)
         elif self._hover:
-            fill = mix(fill, p.text, 0.12)
+            # Keep the white action labels accessible while still giving them
+            # a restrained hover wash.  Lightening a dark action colour with
+            # the pale text colour would otherwise erase the contrast gain.
+            wash = p.shadow if self.kind in {"accent", "success", "danger"} and p.name == "dark" else p.text
+            fill = mix(fill, wash, 0.12)
             if self.kind == "ghost":
                 fg = p.text
         return fill, fg, outline
@@ -120,6 +147,9 @@ class PillButton(tk.Canvas):
                    outline=outline or fill, width=1)
         self.create_text(w / 2, h / 2 + 1, text=self._text, fill=fg,
                          font=self.font, anchor="center")
+        if self._focused and self._state != "disabled":
+            _focus_ring(self, 1.5, 1.5, w - 1.5, h - 1.5,
+                        self._radius, self.p.text)
 
     # -- events ------------------------------------------------------------
 
@@ -133,7 +163,9 @@ class PillButton(tk.Canvas):
 
     def _on_press(self, _e) -> None:
         if self._state == "disabled":
-            return
+            return "break"
+        self.focus_set()
+        self._focused = True
         self._pressed = True
         self._draw()
 
@@ -143,6 +175,34 @@ class PillButton(tk.Canvas):
         self._draw()
         if fire and self.command is not None:
             self.command()
+
+    def _on_focus_in(self, _e) -> None:
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _e) -> None:
+        self._focused = False
+        self._key_down.clear()
+        self._draw()
+
+    def _on_key_press(self, event):
+        if event.keysym not in _ACTIVATION_KEYS:
+            return
+        if self._state == "disabled":
+            return "break"
+        # Tk repeats KeyPress while Space/Return is held.  Only the first
+        # press activates the button; the release arms it again.
+        if event.keysym in self._key_down:
+            return "break"
+        self._key_down.add(event.keysym)
+        if self.command is not None:
+            self.command()
+        return "break"
+
+    def _on_key_release(self, event):
+        if event.keysym in _ACTIVATION_KEYS:
+            self._key_down.discard(event.keysym)
+            return "break"
 
 
 class SegmentedControl(tk.Canvas):
@@ -163,13 +223,21 @@ class SegmentedControl(tk.Canvas):
         self._h = px(height)
         self._hover_index = -1
         self._enabled = True
+        self._focused = False
+        self._key_down: set[str] = set()
         self._widths = self._compute_widths()
+        self._focus_index = self._index_for_value(variable.get())
         super().__init__(parent, height=self._h, width=sum(self._widths) + self._inset * 2,
-                         bg=bg or palette.surface, highlightthickness=0, bd=0, cursor="hand2")
+                         bg=bg or palette.surface, highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=True)
         self.bind("<Button-1>", self._on_click)
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._on_leave)
-        self._trace = variable.trace_add("write", lambda *_a: self._draw())
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<KeyPress>", self._on_key_press)
+        self.bind("<KeyRelease>", self._on_key_release)
+        self._trace = variable.trace_add("write", lambda *_a: self._on_variable_changed())
         self._draw()
 
     def _compute_widths(self) -> list[int]:
@@ -184,7 +252,20 @@ class SegmentedControl(tk.Canvas):
         if enabled == self._enabled:
             return
         self._enabled = enabled
-        self.configure(cursor="hand2" if enabled else "")
+        self._key_down.clear()
+        self.configure(cursor="hand2" if enabled else "", takefocus=enabled)
+        self._draw()
+
+    def _index_for_value(self, value: str) -> int:
+        for i, (_label, option) in enumerate(self.options):
+            if option == value:
+                return i
+        return 0 if self.options else -1
+
+    def _on_variable_changed(self) -> None:
+        index = self._index_for_value(self.var.get())
+        if index >= 0:
+            self._focus_index = index
         self._draw()
 
     def _index_at(self, x: float) -> int:
@@ -219,18 +300,35 @@ class SegmentedControl(tk.Canvas):
             self.create_text(pos + width / 2, self._h / 2 + 1, text=label,
                              fill=fg, font=self.font, anchor="center")
             pos += width
+        if self._focused and self._enabled and self._focus_index >= 0:
+            focus_pos = self._inset + sum(self._widths[:self._focus_index])
+            _focus_ring(self, focus_pos + 1, 1, focus_pos + self._widths[self._focus_index] - 1,
+                        self._h - 1, px(8), self.p.text)
 
-    def _on_click(self, event) -> None:
-        if not self._enabled:
+    def _select_index(self, index: int, invoke: bool = True) -> None:
+        if not (0 <= index < len(self.options)):
             return
-        index = self._index_at(event.x)
-        if index < 0:
-            return
+        self._focus_index = index
         value = self.options[index][1]
         if value != self.var.get():
             self.var.set(value)
-        if self.on_change is not None:
+        else:
+            # A repeated activation does not change the variable, so its
+            # trace will not redraw the focus indicator for us.
+            self._draw()
+        if invoke and self.on_change is not None:
             self.on_change()
+
+    def _on_click(self, event) -> None:
+        if not self._enabled:
+            return "break"
+        self.focus_set()
+        self._focused = True
+        index = self._index_at(event.x)
+        if index < 0:
+            return "break"
+        self._select_index(index)
+        return "break"
 
     def _on_motion(self, event) -> None:
         index = self._index_at(event.x) if self._enabled else -1
@@ -242,6 +340,49 @@ class SegmentedControl(tk.Canvas):
         if self._hover_index != -1:
             self._hover_index = -1
             self._draw()
+
+    def _on_focus_in(self, _e) -> None:
+        self._focused = True
+        if self._focus_index < 0:
+            self._focus_index = self._index_for_value(self.var.get())
+        self._draw()
+
+    def _on_focus_out(self, _e) -> None:
+        self._focused = False
+        self._key_down.clear()
+        self._draw()
+
+    def _on_key_press(self, event):
+        if not self._enabled:
+            return "break"
+        if not self.options:
+            return "break"
+        key = event.keysym
+        if key in _ACTIVATION_KEYS:
+            if key in self._key_down:
+                return "break"
+            self._key_down.add(key)
+            self._select_index(self._focus_index)
+            return "break"
+
+        if key in ("Left", "Right", "Home", "End"):
+            current = self._focus_index
+            if key == "Left":
+                target = max(0, current - 1)
+            elif key == "Right":
+                target = min(len(self.options) - 1, current + 1)
+            elif key == "Home":
+                target = 0
+            else:
+                target = len(self.options) - 1
+            if target != current:
+                self._select_index(target)
+            return "break"
+
+    def _on_key_release(self, event):
+        if event.keysym in _ACTIVATION_KEYS:
+            self._key_down.discard(event.keysym)
+            return "break"
 
 
 class Switch(tk.Canvas):
@@ -259,19 +400,27 @@ class Switch(tk.Canvas):
         self._gap = px(8)
         self._hover = False
         self._enabled = True
+        self._focused = False
+        self._key_down: set[str] = set()
         height = max(self._th, font.metrics("linespace")) + px(6)
         width = self._tw + self._gap + font.measure(text) + px(4)
         super().__init__(parent, width=width, height=height,
-                         bg=bg or palette.surface, highlightthickness=0, bd=0, cursor="hand2")
+                         bg=bg or palette.surface, highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=True)
         self.bind("<Button-1>", self._toggle)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<KeyPress>", self._on_key_press)
+        self.bind("<KeyRelease>", self._on_key_release)
         self._trace = variable.trace_add("write", lambda *_a: self._draw())
         self._draw()
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
-        self.configure(cursor="hand2" if enabled else "")
+        self._key_down.clear()
+        self.configure(cursor="hand2" if enabled else "", takefocus=enabled)
         self._draw()
 
     def _draw(self) -> None:
@@ -294,13 +443,19 @@ class Switch(tk.Canvas):
         self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=knob, outline=knob)
         self.create_text(self._tw + self._gap, cy + 1, text=self._text, fill=fg,
                          font=self.font, anchor="w")
+        if self._focused and self._enabled:
+            _focus_ring(self, 1.5, 1.5, self.winfo_reqwidth() - 1.5,
+                        self.winfo_reqheight() - 1.5, px(7), self.p.text)
 
     def _toggle(self, _e) -> None:
         if not self._enabled:
-            return
+            return "break"
+        self.focus_set()
+        self._focused = True
         self.var.set(not self.var.get())
         if self.command is not None:
             self.command()
+        return "break"
 
     def _on_enter(self, _e) -> None:
         self._hover = True
@@ -309,6 +464,33 @@ class Switch(tk.Canvas):
     def _on_leave(self, _e) -> None:
         self._hover = False
         self._draw()
+
+    def _on_focus_in(self, _e) -> None:
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _e) -> None:
+        self._focused = False
+        self._key_down.clear()
+        self._draw()
+
+    def _on_key_press(self, event):
+        if event.keysym not in _ACTIVATION_KEYS:
+            return
+        if not self._enabled:
+            return "break"
+        if event.keysym in self._key_down:
+            return "break"
+        self._key_down.add(event.keysym)
+        self.var.set(not self.var.get())
+        if self.command is not None:
+            self.command()
+        return "break"
+
+    def _on_key_release(self, event):
+        if event.keysym in _ACTIVATION_KEYS:
+            self._key_down.discard(event.keysym)
+            return "break"
 
 
 class StatusPill(tk.Canvas):

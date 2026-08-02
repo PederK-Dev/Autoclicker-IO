@@ -61,10 +61,12 @@ DARK = Palette(
     border="#2b3240",
     text="#e8ecf3",
     muted="#8d97a8",
-    accent="#4b8cf7",
+    # Action colours are deliberately a little deeper than the decorative
+    # palette so white labels retain WCAG AA contrast on both themes.
+    accent="#386fcb",
     accent_text="#ffffff",
-    success="#2fb865",
-    danger="#e8515f",
+    success="#1f8348",
+    danger="#c23340",
     warn="#e2a33c",
     shadow="#0a0c10",
 )
@@ -80,7 +82,7 @@ LIGHT = Palette(
     muted="#5f6b7d",
     accent="#2f6fe4",
     accent_text="#ffffff",
-    success="#15a35a",
+    success="#0f7d42",
     danger="#d63b48",
     warn="#c17d10",
     shadow="#c3cad6",

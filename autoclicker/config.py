@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import threading
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from . import diagnostics
 from .keys import Hotkey
 
 APP_NAME = "AutoclickerIO"
@@ -16,6 +19,18 @@ DEFAULT_START_HOTKEY = Hotkey(vk=0x74)  # F5
 DEFAULT_STOP_HOTKEY = Hotkey(vk=0x74)  # F5 toggles by default, like the reference app
 DEFAULT_RECORD_HOTKEY = Hotkey(vk=0x76)  # F7
 DEFAULT_PLAY_HOTKEY = Hotkey(vk=0x77)  # F8
+DEFAULT_PANIC_HOTKEY = Hotkey(vk=0x13)  # Pause/Break
+
+# Version zero is the original flat object (there was no explicit version).
+# New files use a small envelope so future migrations can be handled without
+# guessing which fields belonged to which release.
+SETTINGS_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = SETTINGS_SCHEMA_VERSION
+SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
+CONFIG_SCHEMA_VERSION = SETTINGS_SCHEMA_VERSION
+
+_warning_lock = threading.Lock()
+_load_warning: str | None = None
 
 
 def config_dir() -> Path:
@@ -83,17 +98,30 @@ class Settings:
     stop_hotkey: Hotkey = DEFAULT_STOP_HOTKEY
     record_hotkey: Hotkey = DEFAULT_RECORD_HOTKEY
     play_hotkey: Hotkey = DEFAULT_PLAY_HOTKEY
+    panic_hotkey: Hotkey = DEFAULT_PANIC_HOTKEY
 
     # Hotkeys bound to a mouse button normally still reach the app underneath.
     # Turning this on swallows them (never Left/Right — see keys.NEVER_SUPPRESS).
     suppress_hotkeys: bool = True
+
+    # Onboarding / advanced controls ----------------------------------
+    # These fields were added after the initial flat schema and deliberately
+    # default to the old application's behaviour.
+    advanced_mode: bool = False
+    onboarding_complete: bool = False
 
     # Window -----------------------------------------------------------
     theme: str = "dark"
     always_on_top: bool = False
     minimize_on_start: bool = False
 
-    _HOTKEY_FIELDS = ("start_hotkey", "stop_hotkey", "record_hotkey", "play_hotkey")
+    _HOTKEY_FIELDS = (
+        "start_hotkey",
+        "stop_hotkey",
+        "record_hotkey",
+        "play_hotkey",
+        "panic_hotkey",
+    )
 
     # -- interval helpers ---------------------------------------------
 
@@ -138,7 +166,9 @@ class Settings:
         known = {f.name for f in fields(cls)}
         kwargs = {}
         defaults = cls()
-        for key, value in (data or {}).items():
+        if not isinstance(data, dict):
+            return defaults
+        for key, value in data.items():
             if key not in known:
                 continue
             if key in cls._HOTKEY_FIELDS:
@@ -154,21 +184,163 @@ class Settings:
         return settings
 
 
-def load(path: Path | None = None) -> Settings:
-    target = path or config_path()
+def _set_load_warning(message: str | None) -> None:
+    global _load_warning
+    with _warning_lock:
+        _load_warning = message
+
+
+def peek_load_warning() -> str | None:
+    """Return the latest load warning without consuming it."""
+
+    with _warning_lock:
+        return _load_warning
+
+
+def consume_load_warning() -> str | None:
+    """Return and clear the latest load warning (a one-shot UI helper)."""
+
+    global _load_warning
+    with _warning_lock:
+        warning = _load_warning
+        _load_warning = None
+        return warning
+
+
+# Compatibility aliases for UI callers that use getter/take wording.
+get_load_warning = consume_load_warning
+take_load_warning = consume_load_warning
+load_warning = consume_load_warning
+
+
+def _decode_payload(payload: object) -> Settings:
+    """Decode either the current envelope or the original flat JSON object."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("Settings payload must be a JSON object.")
+
+    # Legacy files had no marker and contained fields directly at the root.
+    if "version" not in payload and "schema_version" not in payload and "settings" not in payload:
+        return Settings.from_dict(payload)
+
+    version = payload.get("version", payload.get("schema_version"))
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("Settings version must be an integer.")
+    if version not in (0, SETTINGS_SCHEMA_VERSION):
+        raise ValueError(f"Unsupported settings version: {version}.")
+    values = payload.get("settings")
+    if values is None:
+        # Also accept a version marker added directly to the old flat object;
+        # this costs nothing and makes hand-edited/early migration files safe.
+        values = {key: value for key, value in payload.items() if key not in ("version", "schema_version")}
+    if not isinstance(values, dict):
+        raise ValueError("Settings envelope is missing its object-valued 'settings'.")
+    return Settings.from_dict(values)
+
+
+def _load_json(target: Path) -> Settings:
+    with open(target, "r", encoding="utf-8") as handle:
+        return _decode_payload(json.load(handle))
+
+
+def _backup_candidates(target: Path) -> tuple[Path, ...]:
+    # ``config.json.bak`` is the canonical name.  Also accept ``config.bak``
+    # used by a few early development builds and convenient for callers using
+    # ``Path.with_suffix('.bak')``.
+    canonical = Path(str(target) + ".bak")
+    alternate = target.with_suffix(".bak") if target.suffix else Path(str(target) + ".bak")
+    return (canonical,) if alternate == canonical else (canonical, alternate)
+
+
+def backup_path(path: Path | None = None) -> Path:
+    """Return the canonical on-disk backup path for a settings file."""
+
+    target = Path(path) if path is not None else config_path()
+    return _backup_candidates(target)[0]
+
+
+def _valid_persisted_file(target: Path) -> bool:
     try:
-        with open(target, "r", encoding="utf-8") as handle:
-            return Settings.from_dict(json.load(handle))
-    except (OSError, ValueError, TypeError):
+        _load_json(target)
+        return True
+    except (OSError, ValueError, TypeError, UnicodeError) as exc:
+        diagnostics.log_warning("Ignoring invalid settings file", path=str(target), error=str(exc))
+        return False
+
+
+def load(path: Path | None = None) -> Settings:
+    """Load settings, recovering from a valid ``.bak`` when necessary.
+
+    The warning is retained for one UI read via :func:`consume_load_warning`;
+    missing files on first launch intentionally do not produce a warning.
+    """
+
+    _set_load_warning(None)
+    try:
+        target = Path(path) if path is not None else config_path()
+    except (OSError, TypeError, ValueError) as exc:
+        message = f"Unable to locate settings: {exc}"
+        diagnostics.log_exception(message, exc)
+        _set_load_warning(message)
         return Settings()
+
+    try:
+        return _load_json(target)
+    except FileNotFoundError as exc:
+        primary_error = exc
+        diagnostics.log_warning("Settings file not found", path=str(target))
+    except (OSError, ValueError, TypeError, UnicodeError) as exc:
+        primary_error = exc
+        diagnostics.log_exception("Unable to load settings", exc, path=str(target))
+
+    for backup in _backup_candidates(target):
+        if not backup.exists():
+            continue
+        try:
+            settings = _load_json(backup)
+            message = f"Recovered settings from backup: {backup.name}."
+            diagnostics.log_warning(message, primary=str(target), backup=str(backup))
+            _set_load_warning(message)
+            return settings
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            diagnostics.log_exception("Unable to load settings backup", exc, path=str(backup))
+
+    # A missing file is normal on first run; malformed/unsupported data should
+    # still be visible to the UI and log for troubleshooting.
+    if not isinstance(primary_error, FileNotFoundError):
+        message = f"Settings could not be loaded; defaults were used ({target.name})."
+        _set_load_warning(message)
+    return Settings()
 
 
 def save(settings: Settings, path: Path | None = None) -> None:
-    target = path or config_path()
+    target = Path(path) if path is not None else config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Preserve a known-good previous primary.  Crucially, parse/validate it
+    # before copying so a corrupt primary can never overwrite a good backup.
+    if target.exists() and _valid_persisted_file(target):
+        for backup in _backup_candidates(target):
+            try:
+                shutil.copy2(target, backup)
+            except OSError as exc:
+                diagnostics.log_exception("Unable to create settings backup", exc, path=str(backup))
+
     tmp = target.with_suffix(target.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(settings.to_dict(), handle, indent=2)
-    os.replace(tmp, target)
+    payload = {"version": SETTINGS_SCHEMA_VERSION, "settings": settings.to_dict()}
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except Exception as exc:
+        diagnostics.log_exception("Unable to save settings", exc, path=str(target))
+        try:
+            tmp.unlink()
+        except OSError as cleanup_exc:
+            diagnostics.log_warning("Unable to remove temporary settings file", path=str(tmp), error=str(cleanup_exc))
+        raise
 
 
 def list_profiles() -> list[str]:

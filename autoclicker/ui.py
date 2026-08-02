@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import config, inputs, theme
+from . import config, diagnostics, inputs, theme
 from . import winapi as w
 from .engine import ClickEngine
 from .hooks import HookManager, KeyEvent, MouseEvent
@@ -65,8 +66,8 @@ def _format_duration(seconds: float) -> str:
 class App(tk.Frame):
     """Main window. Owns the engine, hooks and recorder; the view is rebuildable."""
 
-    def __init__(self, master: tk.Tk) -> None:
-        self.settings = config.load()
+    def __init__(self, master: tk.Tk, settings: config.Settings | None = None) -> None:
+        self.settings = settings or config.load()
         self.p = theme.get(self.settings.theme)
         self.f = theme.fonts()
 
@@ -94,6 +95,9 @@ class App(tk.Frame):
         self._swallowed: set[int] = set()
         self._macro_window: MacroWindow | None = None
         self._status_text = "Idle"
+        self._autosave_id: str | None = None
+        self._last_saved_signature = repr(self.settings.to_dict())
+        self._welcome_visible = not self.settings.onboarding_complete
 
         self.container = tk.Frame(self, bg=self.p.bg)
         self.container.pack(fill="both", expand=True)
@@ -101,6 +105,10 @@ class App(tk.Frame):
         self._apply_settings(self.settings)
         self._refresh_hotkey_labels()
         self._sync_mouse_hook()
+
+        load_warning = config.consume_load_warning()
+        if load_warning:
+            self._set_status(load_warning)
 
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(20, self._pump)
@@ -148,6 +156,8 @@ class App(tk.Frame):
     def _build(self) -> None:
         pad = px(14)
         self._build_header(pad)
+        if self._welcome_visible:
+            self._build_welcome(pad)
 
         content = tk.Frame(self.container, bg=self.p.bg)
         content.pack(fill="both", expand=True, padx=pad)
@@ -158,6 +168,8 @@ class App(tk.Frame):
         self._build_click_options(content)
         self._build_repeat(content)
         self._build_position(content)
+        self._build_advanced(content)
+        self._sync_advanced_visibility()
         self._build_actions(pad)
         self._build_footer()
 
@@ -187,8 +199,33 @@ class App(tk.Frame):
                    kind="ghost", height=28, pad=12, bg=self.p.bg).pack(side="right", padx=px(6))
         PillButton(header, "Profiles", self.p, self.f["base"], command=self._popup_profiles,
                    kind="ghost", height=28, pad=12, bg=self.p.bg).pack(side="right")
+        self.btn_advanced = PillButton(
+            header, "Advanced", self.p, self.f["base"], command=self.toggle_advanced,
+            kind="ghost", height=28, pad=12, bg=self.p.bg,
+        )
+        self.btn_advanced.pack(side="right", padx=(0, px(6)))
         self.pill = StatusPill(header, self.p, self.f["base"], bg=self.p.bg)
         self.pill.pack(side="right", padx=px(12))
+
+    def _build_welcome(self, pad: int) -> None:
+        banner = tk.Frame(
+            self.container, bg=self.p.surface, highlightthickness=1,
+            highlightbackground=self.p.accent,
+        )
+        banner.pack(fill="x", padx=pad, pady=(0, px(10)))
+        copy = tk.Frame(banner, bg=self.p.surface)
+        copy.pack(side="left", fill="x", expand=True, padx=px(12), pady=px(9))
+        label(copy, "Start safely", self.p, self.f["bold"]).pack(anchor="w")
+        label(
+            copy,
+            f"Begin at 100 ms, confirm the target, then use {self.settings.start_hotkey.label()} "
+            f"to start or stop. {self.settings.panic_hotkey.label()} always stops every action.",
+            self.p, self.f["small"], muted=True,
+        ).pack(anchor="w", pady=(px(2), 0))
+        PillButton(
+            banner, "Got it", self.p, self.f["base"], command=self.dismiss_welcome,
+            kind="soft", height=30,
+        ).pack(side="right", padx=px(10))
 
     def _build_interval(self, parent) -> None:
         card = Card(parent, "Click interval", self.p, self.f)
@@ -243,15 +280,6 @@ class App(tk.Frame):
         SegmentedControl(body, CLICK_TYPE_CHOICES, self.var_click_type, self.p,
                          self.f["base"], pad=12).pack(anchor="w", pady=(px(4), px(10)))
 
-        row = tk.Frame(body, bg=self.p.surface)
-        row.pack(anchor="w")
-        self.var_hold = tk.StringVar(value="0")
-        self.var_hold_jitter = tk.StringVar(value="0")
-        box, _ = self._field(row, "Hold ms", self.var_hold, 0, 5000, width=6)
-        box.pack(side="left", padx=(0, px(10)))
-        box, _ = self._field(row, "Hold jitter ms", self.var_hold_jitter, 0, 5000, width=6)
-        box.pack(side="left")
-
     def _build_repeat(self, parent) -> None:
         card = Card(parent, "Repeat", self.p, self.f)
         card.grid(row=1, column=1, sticky="nsew", padx=(px(5), 0), pady=(0, px(10)))
@@ -266,15 +294,12 @@ class App(tk.Frame):
         row.pack(anchor="w")
         self.var_repeat_count = tk.StringVar(value="100")
         self.var_duration = tk.StringVar(value="60")
-        self.var_start_delay = tk.StringVar(value="0")
         box, self.spin_repeat = self._field(row, "Clicks", self.var_repeat_count,
                                             1, 10_000_000, width=8)
         box.pack(side="left", padx=(0, px(10)))
         box, self.spin_duration = self._field(row, "Duration secs", self.var_duration,
                                               0.1, 86400, width=8)
         box.pack(side="left", padx=(0, px(10)))
-        box, _ = self._field(row, "Start delay secs", self.var_start_delay, 0, 3600, width=8)
-        box.pack(side="left")
 
     def _build_position(self, parent) -> None:
         card = Card(parent, "Cursor position", self.p, self.f)
@@ -301,16 +326,39 @@ class App(tk.Frame):
                                    command=self.begin_pick, kind="soft", height=30)
         self.btn_pick.pack(side="left", pady=(0, px(14)))
 
-        self.var_jitter = tk.StringVar(value="0")
-        box, _ = self._field(row, "Jitter px", self.var_jitter, 0, 500, width=5)
-        box.pack(side="left", padx=(px(14), 0))
-
-        self.var_restore = tk.BooleanVar(value=True)
-        Switch(row, "Restore cursor after each click", self.var_restore, self.p,
-               self.f["base"]).pack(side="left", padx=(px(16), 0), pady=(0, px(14)))
-
         self.lbl_sequence = label(row, "", self.p, self.f["small"], muted=True)
         self.lbl_sequence.pack(side="right", pady=(0, px(14)))
+
+    def _build_advanced(self, parent) -> None:
+        self.advanced_card = Card(parent, "Advanced behavior", self.p, self.f)
+        self.advanced_card.grid(row=3, column=0, columnspan=2, sticky="ew")
+        body = self.advanced_card.body
+
+        row = tk.Frame(body, bg=self.p.surface)
+        row.pack(fill="x")
+        self.var_hold = tk.StringVar(value="0")
+        self.var_hold_jitter = tk.StringVar(value="0")
+        self.var_start_delay = tk.StringVar(value="0")
+        self.var_jitter = tk.StringVar(value="0")
+        self.var_restore = tk.BooleanVar(value=True)
+
+        fields = [
+            ("Hold ms", self.var_hold, 0, 5000, 6, 1),
+            ("Hold jitter ms", self.var_hold_jitter, 0, 5000, 6, 1),
+            ("Start delay secs", self.var_start_delay, 0, 3600, 8, 0.5),
+            ("Position jitter px", self.var_jitter, 0, 500, 6, 1),
+        ]
+        for caption, var, lo, hi, width, increment in fields:
+            box, _ = self._field(row, caption, var, lo, hi, width=width, increment=increment)
+            box.pack(side="left", padx=(0, px(12)))
+        Switch(
+            row, "Restore cursor after each click", self.var_restore, self.p, self.f["base"],
+        ).pack(side="left", padx=(px(4), 0), pady=(0, px(14)))
+        label(
+            body,
+            "Jitter adds bounded random variation. Start delay gives you time to focus the target app.",
+            self.p, self.f["small"], muted=True,
+        ).pack(anchor="w", pady=(px(5), 0))
 
     def _build_actions(self, pad: int) -> None:
         bar = tk.Frame(self.container, bg=self.p.bg)
@@ -325,6 +373,9 @@ class App(tk.Frame):
                                    height=42, width=170, bg=self.p.bg)
         self.btn_stop.pack(side="left", padx=px(8))
         self.btn_stop.set_state("disabled")
+
+        self.lbl_panic = label(bar, "", self.p, self.f["small"], muted=True, bg=self.p.bg)
+        self.lbl_panic.pack(side="left", padx=(px(8), 0))
 
         PillButton(bar, "Record & playback", self.p, self.f["base"],
                    command=self.open_macros, kind="soft", height=42,
@@ -384,6 +435,41 @@ class App(tk.Frame):
         finally:
             menu.grab_release()
 
+    def toggle_advanced(self) -> None:
+        self.settings.advanced_mode = not self.settings.advanced_mode
+        self._sync_advanced_visibility()
+        self._queue_autosave()
+
+    def _sync_advanced_visibility(self) -> None:
+        if self.settings.advanced_mode:
+            self.advanced_card.grid()
+            self.btn_advanced.set_text("Basic view")
+            return
+        self.advanced_card.grid_remove()
+        active = sum(
+            (
+                _to_int(self.var_hold.get(), 0, 0) > 0,
+                _to_int(self.var_hold_jitter.get(), 0, 0) > 0,
+                _to_float(self.var_start_delay.get(), 0.0, 0.0) > 0,
+                _to_int(self.var_jitter.get(), 0, 0) > 0,
+                not bool(self.var_restore.get()),
+            )
+        )
+        suffix = f" · {active} active" if active else ""
+        self.btn_advanced.set_text(f"Advanced{suffix}")
+
+    def dismiss_welcome(self) -> None:
+        self.settings.onboarding_complete = True
+        self._welcome_visible = False
+        settings = self._collect()
+        self.container.destroy()
+        self.container = tk.Frame(self, bg=self.p.bg)
+        self.container.pack(fill="both", expand=True)
+        self._build()
+        self._apply_settings(settings)
+        self._refresh_hotkey_labels()
+        self._queue_autosave()
+
     # ------------------------------------------------------------------
     # Settings <-> widgets
     # ------------------------------------------------------------------
@@ -412,6 +498,8 @@ class App(tk.Frame):
         self.var_y.set(str(s.pos_y))
         self.var_jitter.set(str(s.position_jitter))
         self.var_restore.set(s.restore_cursor)
+        self.settings.advanced_mode = bool(s.advanced_mode)
+        self.settings.onboarding_complete = bool(s.onboarding_complete)
 
         self.var_on_top = getattr(self, "var_on_top", tk.BooleanVar())
         self.var_minimize = getattr(self, "var_minimize", tk.BooleanVar())
@@ -419,6 +507,7 @@ class App(tk.Frame):
         self.var_minimize.set(s.minimize_on_start)
         self._apply_on_top()
         self._sync_enabled()
+        self._sync_advanced_visibility()
 
     def _collect(self) -> config.Settings:
         s = self.settings
@@ -445,6 +534,8 @@ class App(tk.Frame):
         s.pos_y = _to_int(self.var_y.get(), 0)
         s.position_jitter = _to_int(self.var_jitter.get(), 0, 0)
         s.restore_cursor = bool(self.var_restore.get())
+        s.advanced_mode = bool(self.settings.advanced_mode)
+        s.onboarding_complete = bool(self.settings.onboarding_complete)
 
         s.always_on_top = bool(self.var_on_top.get())
         s.minimize_on_start = bool(self.var_minimize.get())
@@ -471,6 +562,7 @@ class App(tk.Frame):
             text=f"{len(self.settings.sequence)} point(s) captured"
             if position == "sequence" else ""
         )
+        self._sync_advanced_visibility()
         self._update_rate_label()
 
     def _update_rate_label(self) -> None:
@@ -490,6 +582,28 @@ class App(tk.Frame):
             text = "Interval must be above zero" if bad else f"≈ {1 / high:,.1f}–{1 / low:,.1f} clicks per second"
         self.lbl_rate.configure(text=text, fg=self.p.warn if bad else self.p.text)
 
+    def _numeric_input_errors(self) -> list[str]:
+        fields = [
+            ("Hours", self.var_hours), ("Minutes", self.var_minutes),
+            ("Seconds", self.var_seconds), ("Milliseconds", self.var_millis),
+            ("Random minimum", self.var_rand_min), ("Random maximum", self.var_rand_max),
+            ("Click count", self.var_repeat_count), ("Duration", self.var_duration),
+            ("Hold time", self.var_hold), ("Hold jitter", self.var_hold_jitter),
+            ("Start delay", self.var_start_delay), ("X position", self.var_x),
+            ("Y position", self.var_y), ("Position jitter", self.var_jitter),
+        ]
+        errors = []
+        for caption, variable in fields:
+            raw = variable.get().strip()
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                errors.append(f"{caption} must be a number.")
+                continue
+            if not math.isfinite(value):
+                errors.append(f"{caption} must be a finite number.")
+        return errors
+
     def _apply_on_top(self) -> None:
         self.master.attributes("-topmost", bool(self.var_on_top.get()))
 
@@ -500,19 +614,42 @@ class App(tk.Frame):
     def start_clicking(self) -> None:
         if self.engine.running or self.player.running or self.recorder.active:
             return
+        input_errors = self._numeric_input_errors()
+        if input_errors:
+            messagebox.showerror(APP_TITLE, "\n".join(input_errors), parent=self.master)
+            self._set_status("Correct the numeric settings before starting")
+            return
         settings = self._collect()
-        problems = self.engine.start(settings)
+        run_settings = config.Settings.from_dict(settings.to_dict())
+        problems = self.engine.start(run_settings)
         if problems:
             messagebox.showerror(APP_TITLE, "\n".join(problems), parent=self.master)
             return
         self.btn_start.set_state("disabled")
         self.btn_stop.set_state("normal")
-        if settings.minimize_on_start:
+        if run_settings.minimize_on_start:
             self.master.iconify()
 
     def stop_clicking(self) -> None:
         self.engine.stop()
         self.player.stop()
+
+    def panic_stop(self) -> None:
+        """Immediately stop every active automation path."""
+        self.engine.stop()
+        self.player.stop()
+        if self.recorder.active:
+            self.macro = self.recorder.stop()
+            if self._macro_window is not None and self._macro_window.winfo_exists():
+                self._macro_window._populate()
+        self._set_status(f"Emergency stop — {self.settings.panic_hotkey.label()}")
+        self.after(100, self._finish_panic_stop)
+
+    def _finish_panic_stop(self) -> None:
+        if self.engine.running or self.player.running or self.recorder.active:
+            self.after(50, self._finish_panic_stop)
+            return
+        self._set_status(f"Emergency stop — {self.settings.panic_hotkey.label()}")
 
     def toggle_clicking(self) -> None:
         if self.engine.running:
@@ -553,11 +690,21 @@ class App(tk.Frame):
         name = SimplePrompt.ask(self, "Save profile", "Profile name:")
         if not name:
             return
-        config.save(self._collect(), config.profile_path(name))
+        try:
+            config.save(self._collect(), config.profile_path(name))
+        except OSError as exc:
+            diagnostics.log_exception("Could not save profile", exc)
+            messagebox.showerror(
+                APP_TITLE, f"The profile could not be saved:\n{exc}", parent=self.master,
+            )
+            return
         self._set_status(f"Saved profile “{config.safe_profile_name(name)}”")
 
     def load_profile(self, name: str) -> None:
         loaded = config.load(config.profile_path(name))
+        load_warning = config.consume_load_warning()
+        if load_warning:
+            messagebox.showwarning(APP_TITLE, load_warning, parent=self.master)
         theme_changed = loaded.theme != self.p.name
         self.settings = loaded
         if theme_changed:
@@ -577,6 +724,7 @@ class App(tk.Frame):
         self._apply_settings(self.settings)
         self._refresh_hotkey_labels()
         self._sync_mouse_hook()
+        self._queue_autosave()
 
     def show_about(self) -> None:
         messagebox.showinfo(
@@ -596,8 +744,10 @@ class App(tk.Frame):
             self._hotkey_summary = (
                 f"Start  {s.start_hotkey.label()}   ·   Stop  {s.stop_hotkey.label()}"
             )
+        self._hotkey_summary += f"   ·   Panic  {s.panic_hotkey.label()}"
         self.btn_start.set_text(f"Start  ·  {s.start_hotkey.label()}")
         self.btn_stop.set_text(f"Stop  ·  {s.stop_hotkey.label()}")
+        self.lbl_panic.configure(text=f"Panic stop  {s.panic_hotkey.label()}")
 
     def _set_status(self, text: str) -> None:
         self._status_text = text
@@ -609,7 +759,9 @@ class App(tk.Frame):
 
     def _hotkeys(self) -> tuple[Hotkey, ...]:
         s = self.settings
-        return (s.start_hotkey, s.stop_hotkey, s.record_hotkey, s.play_hotkey)
+        return (
+            s.start_hotkey, s.stop_hotkey, s.record_hotkey, s.play_hotkey, s.panic_hotkey,
+        )
 
     def _sync_mouse_hook(self) -> None:
         """Install the global mouse hook only while something needs it."""
@@ -738,6 +890,9 @@ class App(tk.Frame):
             return
 
         s = self.settings
+        if matches(s.panic_hotkey, event.vk):
+            self.panic_stop()
+            return
         if s.start_hotkey == s.stop_hotkey:
             if matches(s.start_hotkey, event.vk):
                 self.toggle_clicking()
@@ -767,13 +922,29 @@ class App(tk.Frame):
         self.btn_stop.set_state("disabled")
         word = {"finished": "Finished", "error": "Stopped (error)"}.get(reason, "Stopped")
         self._set_status(f"{word} after {self.engine.clicks:,} clicks")
+        if reason == "error":
+            detail = self.engine.last_error or "The click engine stopped unexpectedly."
+            messagebox.showerror(
+                APP_TITLE,
+                f"{detail}\n\nDiagnostic log:\n{diagnostics.log_path()}",
+                parent=self.master,
+            )
         if self.settings.minimize_on_start:
             self.master.deiconify()
 
     def _on_player_done(self, reason: str) -> None:
         if self._macro_window is not None and self._macro_window.winfo_exists():
             self._macro_window.on_playback_done(reason)
-        self._set_status("Playback finished" if reason == "finished" else "Playback stopped")
+        if reason == "error":
+            detail = self.player.last_error or "Macro playback stopped unexpectedly."
+            self._set_status("Playback stopped because of an error")
+            messagebox.showerror(
+                "Record & playback",
+                f"{detail}\n\nDiagnostic log:\n{diagnostics.log_path()}",
+                parent=self.master,
+            )
+        else:
+            self._set_status("Playback finished" if reason == "finished" else "Playback stopped")
 
     def _tick(self) -> None:
         x, y = inputs.cursor_pos()
@@ -810,19 +981,58 @@ class App(tk.Frame):
 
         if self._macro_window is not None and self._macro_window.winfo_exists():
             self._macro_window.refresh_counter()
+        self._queue_autosave()
         self.after(100, self._tick)
 
     # ------------------------------------------------------------------
 
+    def _settings_signature(self) -> str:
+        return repr(self._collect().to_dict())
+
+    def _queue_autosave(self) -> None:
+        # The engine owns the Settings snapshot passed to its worker thread.
+        # Do not mutate that shared object by collecting live widget values
+        # until every automation path is idle.
+        if self.engine.running or self.player.running or self.recorder.active:
+            return
+        if self._autosave_id is not None:
+            return
+        if self._settings_signature() == self._last_saved_signature:
+            return
+        self._autosave_id = self.after(750, self._autosave)
+
+    def _autosave(self) -> None:
+        self._autosave_id = None
+        if self.engine.running or self.player.running or self.recorder.active:
+            self._autosave_id = self.after(1_000, self._autosave)
+            return
+        try:
+            settings = self._collect()
+            config.save(settings)
+            self._last_saved_signature = repr(settings.to_dict())
+        except OSError as exc:
+            diagnostics.log_exception("Could not autosave settings", exc)
+            self._set_status("Settings could not be saved — see the diagnostic log")
+            self._autosave_id = self.after(10_000, self._allow_autosave_retry)
+
+    def _allow_autosave_retry(self) -> None:
+        self._autosave_id = None
+
     def on_close(self) -> None:
+        if self._autosave_id is not None:
+            try:
+                self.after_cancel(self._autosave_id)
+            except tk.TclError:
+                pass
+            self._autosave_id = None
         self.engine.stop(join=True)
         self.player.stop(join=True)
         if self.recorder.active:
             self.recorder.stop()
         try:
             config.save(self._collect())
-        except OSError:
-            pass
+        except OSError as exc:
+            diagnostics.log_exception("Could not save settings during shutdown", exc)
         self.hooks.stop()
         self.master.destroy()
 
@@ -881,6 +1091,7 @@ class HotkeyWindow(Dialog):
         ("stop_hotkey", "Stop clicking"),
         ("record_hotkey", "Start/stop recording"),
         ("play_hotkey", "Start/stop playback"),
+        ("panic_hotkey", "Emergency stop"),
     ]
 
     def __init__(self, app: App) -> None:
@@ -956,6 +1167,27 @@ class HotkeyWindow(Dialog):
         self.app.capture_hotkey(name, done)
 
     def save(self) -> None:
+        conflicts: list[str] = []
+        entries = list(self.pending.items())
+        labels = dict(self.FIELDS)
+        for index, (left_name, left_hotkey) in enumerate(entries):
+            for right_name, right_hotkey in entries[index + 1:]:
+                if left_hotkey != right_hotkey:
+                    continue
+                if {left_name, right_name} == {"start_hotkey", "stop_hotkey"}:
+                    continue
+                conflicts.append(
+                    f"{labels[left_name]} and {labels[right_name]} both use "
+                    f"{left_hotkey.label()}."
+                )
+        if conflicts:
+            messagebox.showerror(
+                "Hotkeys",
+                "Each action needs a unique binding, except Start and Stop may share one "
+                "to toggle.\n\n" + "\n".join(conflicts),
+                parent=self,
+            )
+            return
         for name, hotkey in self.pending.items():
             setattr(self.app.settings, name, hotkey)
         self.app.settings.suppress_hotkeys = bool(self.var_suppress.get())
@@ -963,8 +1195,15 @@ class HotkeyWindow(Dialog):
         self.app._sync_mouse_hook()
         try:
             config.save(self.app._collect())
-        except OSError:
-            pass
+        except OSError as exc:
+            diagnostics.log_exception("Could not save hotkeys", exc)
+            messagebox.showerror(
+                "Hotkeys",
+                f"The hotkeys were applied but could not be saved.\n\n{exc}\n\n"
+                f"Diagnostic log:\n{diagnostics.log_path()}",
+                parent=self,
+            )
+            return
         self.close()
 
     def close(self) -> None:
@@ -1128,7 +1367,11 @@ class MacroWindow(Dialog):
         self.refresh_counter()
 
     def clear(self) -> None:
-        if self.app.recorder.active:
+        if self.app.recorder.active or self.app.player.running:
+            messagebox.showinfo(
+                "Record & playback", "Stop recording or playback before clearing the macro.",
+                parent=self,
+            )
             return
         self.app.macro = Macro()
         self._populate()
@@ -1142,10 +1385,24 @@ class MacroWindow(Dialog):
             initialdir=str(macros_dir()), filetypes=[("Macro files", "*.json")],
         )
         if path:
-            self.app.macro.save(Path(path))
+            try:
+                self.app.macro.save(Path(path))
+            except OSError as exc:
+                diagnostics.log_exception("Could not save macro", exc)
+                messagebox.showerror(
+                    "Record & playback", f"The macro could not be saved:\n{exc}", parent=self,
+                )
+                return
             self.lbl_info.configure(text=f"Saved to {Path(path).name}")
+            self.app._set_status(f"Saved macro “{Path(path).name}”")
 
     def load_macro(self) -> None:
+        if self.app.recorder.active or self.app.player.running:
+            messagebox.showinfo(
+                "Record & playback", "Stop recording or playback before loading a macro.",
+                parent=self,
+            )
+            return
         path = filedialog.askopenfilename(
             parent=self, title="Load macro", initialdir=str(macros_dir()),
             filetypes=[("Macro files", "*.json"), ("All files", "*.*")],
@@ -1161,6 +1418,13 @@ class MacroWindow(Dialog):
         self._populate()
 
     def use_as_sequence(self) -> None:
+        if self.app.recorder.active or self.app.player.running:
+            messagebox.showinfo(
+                "Record & playback",
+                "Stop recording or playback before changing the click sequence.",
+                parent=self,
+            )
+            return
         points = self.app.macro.click_points()
         if not points:
             messagebox.showinfo("Record & playback", "This macro has no click points.", parent=self)
@@ -1186,7 +1450,7 @@ def run() -> None:
     w.enable_dpi_awareness()
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.resizable(False, False)
+    root.resizable(True, True)
     theme.init_scaling(root)
 
     settings = config.load()
@@ -1194,5 +1458,8 @@ def run() -> None:
     root.configure(bg=palette.bg)
     theme.apply_ttk(root, palette, theme.fonts())
 
-    App(root)
+    app = App(root, settings=settings)
+    root.update_idletasks()
+    root.minsize(min(root.winfo_reqwidth(), px(760)), min(root.winfo_reqheight(), px(620)))
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

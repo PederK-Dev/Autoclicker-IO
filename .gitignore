@@ -42,6 +42,7 @@ pip-wheel-metadata/
 # Editors and IDEs
 .idea/
 .vscode/
+.impeccable/
 *.code-workspace
 *.swp
 *.swo

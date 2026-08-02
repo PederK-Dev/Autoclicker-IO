@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from . import diagnostics
 from . import inputs
 from .config import Settings
 
@@ -32,6 +33,9 @@ class ClickEngine:
         self.clicks = 0
         self.started_at = 0.0
         self.pending_delay = 0.0
+        # A concise, UI-friendly description of the most recent worker error.
+        # ``None`` means the engine has not failed since the last start.
+        self.last_error: str | None = None
 
     # -- state -------------------------------------------------------------
 
@@ -50,7 +54,13 @@ class ClickEngine:
         with self._lock:
             if self.running:
                 return []
-            problems = settings.validate()
+            self.last_error = None
+            try:
+                problems = settings.validate()
+            except Exception as exc:
+                self.last_error = f"Settings validation failed: {exc}"
+                diagnostics.log_exception("Click engine settings validation failed", exc)
+                return [self.last_error]
             if problems:
                 return problems
             self._cancel.clear()
@@ -73,9 +83,11 @@ class ClickEngine:
     # -- worker ------------------------------------------------------------
 
     def _run(self, settings: Settings) -> None:
-        inputs.begin_high_resolution_timers()
         reason = "stopped"
+        timers_started = False
         try:
+            inputs.begin_high_resolution_timers()
+            timers_started = True
             if settings.start_delay > 0:
                 deadline = time.perf_counter() + settings.start_delay
                 while True:
@@ -115,17 +127,22 @@ class ClickEngine:
                 interval = self._next_interval(settings)
                 if not inputs.precise_sleep(interval, self._cancel):
                     break
-        except Exception:
+        except Exception as exc:
             reason = "error"
-            raise
+            self.last_error = f"{type(exc).__name__}: {exc}" or type(exc).__name__
+            diagnostics.log_exception("Click engine worker failed", exc)
         finally:
-            inputs.end_high_resolution_timers()
+            if timers_started:
+                try:
+                    inputs.end_high_resolution_timers()
+                except Exception as exc:
+                    diagnostics.log_exception("Unable to restore timer resolution", exc)
             self.pending_delay = 0.0
             if self._on_finished is not None:
                 try:
                     self._on_finished(reason)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    diagnostics.log_exception("Click engine completion callback failed", exc)
 
     # -- helpers -----------------------------------------------------------
 
@@ -151,24 +168,28 @@ class ClickEngine:
         self, settings: Settings, target: tuple[int, int] | None, repeats: int
     ) -> None:
         origin = None
-        if target is not None:
-            if settings.restore_cursor:
-                origin = inputs.cursor_pos()
-            inputs.move_to(*target)
+        try:
+            if target is not None:
+                if settings.restore_cursor:
+                    origin = inputs.cursor_pos()
+                inputs.move_to(*target)
 
-        hold = max(0, settings.hold_ms) / 1000.0
-        if settings.hold_jitter_ms > 0:
-            hold += random.uniform(0, settings.hold_jitter_ms / 1000.0)
+            hold = max(0, settings.hold_ms) / 1000.0
+            if settings.hold_jitter_ms > 0:
+                hold += random.uniform(0, settings.hold_jitter_ms / 1000.0)
 
-        for i in range(repeats):
-            if i:
-                inputs.precise_sleep(_MULTI_CLICK_GAP, self._cancel)
-                if self._cancel.is_set():
-                    break
-            inputs.click(settings.button, hold)
-
-        if origin is not None:
-            inputs.move_to(*origin)
+            for i in range(repeats):
+                if i:
+                    inputs.precise_sleep(_MULTI_CLICK_GAP, self._cancel)
+                    if self._cancel.is_set():
+                        break
+                inputs.click(settings.button, hold)
+        finally:
+            if origin is not None:
+                # Cursor restoration is part of the click contract.  If the
+                # restore itself fails, let the worker's outer handler record
+                # the error while still attempting it exactly once.
+                inputs.move_to(*origin)
 
     def _next_interval(self, settings: Settings) -> float:
         if settings.interval_mode == "random":
